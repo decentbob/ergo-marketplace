@@ -4,6 +4,17 @@
 
 This document works outward from what the chain guarantees to what it can't. It builds on the framing in [VISION.md](VISION.md): a neutral settlement protocol with competing services stacked above it, split into **trustless trade** (both sides on-chain, settled atomically, basically a solved problem reused from existing Ergo infrastructure) and **mediated trade** (at least one side off-chain, where a per-trade mediator sits between match and settlement, and where almost all of the design's complexity lives). The three [core open problems](VISION.md#the-hard-parts) the trust layer can't close are laid out in the vision doc, and the sections here point back to them.
 
+**Contents**
+
+- [Why Ergo](#why-ergo)
+- [Architecture overview](#architecture-overview)
+- [The on-chain layer](#the-on-chain-layer-what-the-chain-enforces): [mediated escrow](#mediated-escrow), [choosing parameters](#choosing-parameters), [listing options](#listing-options), [register interface & contract family](#register-interface--the-contract-family), [bots & keepers](#bots-solvers--keepers)
+- [The trust layer](#the-trust-layer-what-the-chain-cannot-enforce): [mediators](#mediators), [evidence & delivery](#evidence--delivery-verification), [receipts](#receipts-the-proof-of-purchase-primitive), [reputation](#reputation), [identity](#identity), [discovery](#discovery-type-standards), [reviews](#reviews)
+- [Connective systems](#connective-systems): [currencies](#currencies), [communication](#communication), [privacy](#privacy), [composability](#composability-with-other-protocols)
+- [The application layer](#the-application-layer): [front-ends & curation](#front-ends--curation), [verification](#verification-the-client-library-and-the-wallet), [monetization](#monetization), [light clients](#light-clients)
+- [Honest accounting](#honest-accounting): [risk register](#risk-register)
+- [Appendix A: guards & transaction examples](#appendix-a-full-transaction-examples) · [B: escrow economics](#appendix-b-escrow-economics) · [C: glossary](#appendix-c-glossary)
+
 # Why Ergo
 
 Ergo uses an eUTXO model and ships with a set of tools this design leans on:
@@ -13,7 +24,7 @@ Ergo uses an eUTXO model and ships with a set of tools this design leans on:
 - **Atomic trades.** A swap either completes in full or fails in full.
 - **Covenants.** Boxes can enforce whatever output structure a contract needs (escrow constraints, fee outputs, multi-recipient splits), and the spender can't get around it for that specific box.
 - **Sigma protocols.** Native zero-knowledge primitives that make sealed-bid auctions, ring signatures (for anonymous verified reviews), and other privacy-preserving proofs possible.
-- **AVL+ trees.** A native authenticated data structure that lives in registers, with membership proofs verifiable on-chain. Useful for mediator acceptance sets, affiliate whitelists, and registry membership, where the set might be large but only one proof has to fit in a transaction.
+- **AVL+ trees.** A native authenticated data structure that lives in registers, with membership proofs verifiable on-chain. Useful for mediator acceptance sets, affiliate whitelists, and recognized-set membership, where the set might be large but only one proof has to fit in a transaction.
 - **Data inputs.** Read-only references to other boxes inside a transaction. They let a listing pull configuration (fees, shipping tables, oracle prices) from a separate Config Box without consuming it. This is the mechanism behind the sidecar pattern.
 - **Storage rent.** Native on-chain garbage collection: boxes nobody touches for about 4 years can be reclaimed by miners, so abandoned listings don't bloat the state forever. The minimum ERG every box has to lock also puts a small capital cost on each listing.
 - **Cheap.** A complex transaction runs well under 0.01 ERG.
@@ -22,7 +33,11 @@ Ergo uses an eUTXO model and ships with a set of tools this design leans on:
 
 # Architecture overview
 
-The chain settles. Everything else sits above it in competing layers (front-ends, off-chain services, federated registries, bots, and the immutable core contracts), where teams can build without needing protocol-wide consensus. The [layer diagram and trust table](VISION.md#how-it-works-at-a-glance) are in the vision doc; this document specifies the layers themselves. The [risk register](#risk-register) is the failure-mode counterpart to that trust table.
+The chain settles. Everything else sits above it in competing layers (front-ends, the client library, off-chain services, type standards, bots, and the immutable core contracts), where teams can build without needing protocol-wide consensus. The [layer diagram](VISION.md#how-it-works-at-a-glance) is in the vision doc; this document specifies the layers themselves, and the [trust-layer summary](#the-trust-layer-in-summary) gives the role-by-role trust table. The [risk register](#risk-register) is the failure-mode counterpart to that table.
+
+**The client library.** All client-side protocol logic lives in one headless library: box specifications, validation, transaction builders, and decoding a box into readable escrow state. Its only contact with the outside is a box-finder that points at a node, a public explorer, or an indexer, so one library serves a fast indexer-backed front-end and a node-only light client by swapping that backend. Front-ends, bots, and light clients are thin consumers of it, which keeps transaction-building in one audited place. It is the reference implementation of the protocol; [Light clients](#light-clients) covers the node-only path.
+
+**What needs a server.** Nothing on the trade path does. Core trade and signing, the v0 OTC escrow link, discovery by node scan, on-chain listing metadata, and content-addressed front-end delivery all run with no server. A server only buys convenience: fast search and indexing, push notifications, and third-party API-key custody for fiat on/off-ramps. Each stays optional, independently verifiable or swappable, with the no-server path underneath, so none turns into a trust dependency.
 
 One detail the diagram leaves out: buyer and seller exchange contact details over an off-chain channel (Signal, Telegram), bootstrapped by an on-chain handshake (see [Communication](#communication)).
 
@@ -30,7 +45,7 @@ One detail the diagram leaves out: buyer and seller exchange contact details ove
 
 # The on-chain layer: what the chain enforces
 
-This layer provides strong cryptographic guarantees: settlement is atomic, listings can't be spent against their own terms, and escrowed funds can only leave through the paths their contract allows.
+This layer provides strong cryptographic guarantees: settlement is atomic, listings can't be spent against their own terms, a purchase can only open the canonical escrow box with its terms copied faithfully from the listing, and escrowed funds can only leave through the paths their contract allows.
 
 ## Trustless trade
 
@@ -44,9 +59,9 @@ These contracts already exist on Ergo in production form. The protocol just adds
 
 Mediated trade for physical goods and services isn't a solved problem on Ergo today. This is where the design earns its keep.
 
-**Flow.** A seller lists a physical item with metadata, a price, how that price gets distributed on a successful sale, an acceptable mediator (or set of them), and optionally a seller bond and a buyer bond. The buyer purchases by signing a transaction that consumes the listing box and creates an **Escrow Box** holding *price + optional seller bond + optional buyer bond*, naming one specific mediator from the seller's accepted set. The seller ships off-chain and claims shipment on-chain; the buyer confirms receipt, or the inspection window expires. How the escrow behaves across that lifecycle is governed by the state machine below.
+**Flow.** A seller lists a physical item with metadata, a price, how that price gets distributed on a successful sale, an acceptable mediator (or set of them), and optionally a seller bond and a buyer bond. The buyer purchases by signing a transaction that consumes the listing box and creates an **Escrow Box** holding *price + optional seller bond + optional buyer bond*, naming one specific mediator from the seller's accepted set. The listing contract enforces this purchase: the escrow output must be the canonical escrow contract (pinned by ErgoTree hash), with its terms copied faithfully from the listing, inside the guardrails, and the chosen mediator proven to be in the seller's accepted set. The purchase also mints a singleton **State NFT** into the Escrow Box, preserved across every transition and burned at terminal settlement, so the live box is locatable by its token id and a recreated box can't be passed off as a fresh escrow (see [Glossary](#appendix-c-glossary)). The seller ships off-chain and claims shipment on-chain; the buyer confirms receipt, or the inspection window expires. How the escrow behaves across that lifecycle is governed by the state machine below.
 
-**Price distribution.** The seller doesn't have to be the only recipient. A listing declares a set of `(address, share)` outputs: the seller, plus any front-end originator, affiliate, or drop-ship supplier, all of them parties whose payment depends on the sale completing. The buyer pays one total and the contract splits it on settlement (front-ends shouldn't bolt many recipients onto tiny sales, since sub-dust outputs fail). Recipients get paid **only to the extent the sale settles in the seller's favor**. A scammed buyer's refund is never trimmed to pay them, and on a dispute every recipient takes the same proportional haircut the seller does. Sale-contingent parties earn on a completed sale and not on a refunded one, so this is the right treatment. Any party whose payment should *survive* a buyer refund (a shipping carrier, a supplier doing independent work) doesn't belong in the pool at all; the seller pays them separately as a cost of doing business. The human-readable labels live off-chain in metadata, and the contract only ever sees addresses and shares.
+**Price distribution.** The seller doesn't have to be the only recipient. A listing declares a set of `(address, share)` outputs: the seller, plus any front-end originator, affiliate, or drop-ship supplier, all of them parties whose payment depends on the sale completing. The buyer pays one total and the contract splits it on settlement (front-ends shouldn't bolt many recipients onto tiny sales, since sub-dust outputs fail). The contract bounds the recipient count, requires positive shares over a fixed denominator, matches recipients to outputs positionally, and runs the share multiply through a BigInt intermediate so a large price can't overflow, keeping the split a single bounded pass safe against a malformed distribution. Recipients get paid **only to the extent the sale settles in the seller's favor**. A scammed buyer's refund is never trimmed to pay them, and on a dispute every recipient takes the same proportional haircut the seller does. Sale-contingent parties earn on a completed sale and not on a refunded one, so this is the right treatment. Any party whose payment should *survive* a buyer refund (a shipping carrier, a supplier doing independent work) doesn't belong in the pool at all; the seller pays them separately as a cost of doing business. The human-readable labels live off-chain in metadata, and the contract only ever sees addresses and shares.
 
 ### Two phases
 
@@ -59,7 +74,7 @@ The escrow has two normal phases, `Active` and `Claimed`, plus a `Disputed` stat
 | `Disputed` | `mediation_deadline` | (mediator rules; timeout favors buyer) | Mediator decides; fallback fires on timeout |
 
 - **`Active` (pre-claim).** The buyer has paid, and the seller hasn't made any on-chain claim of shipment yet. The buyer waits out a seller-set `claim_by` window, and once it passes they can trigger a **timed refund** that returns the price and both bonds. This is a *race* rather than a forced outcome: the seller can still claim or refund right up until the buyer actually reclaims. Nothing fires by itself.
-- **`Claimed` (post-claim).** The seller has claimed shipment, which sets `deadline = claim_height + inspection_window`. The claim also states an expected shipping time, which is context and isn't enforced; the buyer should normally wait for that to pass before disputing non-arrival, though they're allowed to dispute earlier. The window has to be generous enough to cover shipping, inspection, and some unforeseen delay on top. The buyer can confirm receipt at any time to release the funds immediately; otherwise, once the window closes, the seller can trigger a **timed release**. The buyer's tool against a package that never arrives or arrives wrong is the *dispute*, which is available throughout this phase and pauses the clock.
+- **`Claimed` (post-claim).** The seller has claimed shipment, which sets `deadline = claim_height + inspection_window`. The claim also states an expected shipping time, which is context and isn't enforced; the buyer should normally wait for that to pass before disputing non-arrival, though they're allowed to dispute earlier. The window has to be generous enough to cover shipping, inspection, and some unforeseen delay on top. The buyer can confirm receipt at any time to release the funds immediately; otherwise, once the window closes, the seller can trigger a **timed release**. The buyer's tool against a package that never arrives or arrives wrong is the *dispute*, available throughout this phase, which stops the timed release and starts the mediation clock.
 - **`Disputed`.** A mediator decides. The clock gets replaced by a `mediation_deadline` (see [Mediators](#mediators)).
 
 Two principles run the system, and they're mirror images of each other:
@@ -69,7 +84,7 @@ Two principles run the system, and they're mirror images of each other:
 
 Nothing in eUTXO happens automatically. Once the timer passes, the favorable direction simply becomes *spendable*. The **timed refund** can be triggered by the buyer (which fits the pre-claim race), and the **timed release** by the seller or by a keeper bot (see [Bots, solvers & keepers](#bots-solvers--keepers)), so the seller doesn't have to sit and watch the clock.
 
-The buyer's side has no keeper and doesn't need one, because **filing a dispute pauses the timer.** The buyer's only liveness obligation is to *notice once and file once* inside a window measured in weeks. After that the clock runs on the mediator instead of the buyer, and the wallet just has to surface the timer and send reminders. That's a real regression against a custodial platform's "complain whenever you want from your phone," but a mild one, and it's the price of the funds never sitting in a platform's wallet in the first place.
+The buyer's side has no keeper and doesn't need one, because **filing a dispute takes the buyer off the clock.** The buyer's only liveness obligation is to *notice once and file once* inside a window measured in weeks. After that the clock runs on the mediator instead of the buyer, and the wallet just has to surface the timer and send reminders. That's a real regression against a custodial platform's "complain whenever you want from your phone," but a mild one, and it's the price of the funds never sitting in a platform's wallet in the first place.
 
 **Tracking is how the seller stays accountable, and it's optional.** The claim transition carries an optional tracking commitment, and the recommended seller flow is to **claim at dispatch with tracking attached.** Tracking proves *something* was sent, but not *what* was sent, so it defends against the seller who never shipped, not the seller who shipped a rock. A claim with no tracking is still valid, but it's flagged as such to the buyer and counts for less in any dispute. A future carrier-API oracle could confirm delivery, which would allow a tighter, better-defined shipping and inspection window than a self-asserted claim does (see [Evidence & delivery verification](#evidence--delivery-verification)).
 
@@ -81,8 +96,8 @@ Whatever phase it's in, the escrow can only ever release funds through three ter
 
 - **Success.** The buyer signs "received," or the inspection window expires in `Claimed`. The full price gets distributed across the seller-side recipients in their declared proportions, any seller bond returns to the seller, and any buyer bond returns to the buyer.
 - **Refund.** The seller signs "refund" (available in `Active` or `Claimed`, not once a dispute is open), or the buyer triggers a timed refund after `claim_by` in `Active`. The full price goes back to the buyer, no seller-side recipient is paid, and both bonds return to their posters.
-- **Dispute.** Either party flips the state to `Disputed`, the clock pauses, and the mediator decides each pool:
-  - **Price split:** what share of the price the buyer gets back. The rest goes to the seller-side recipients in their declared proportions. The mediator moves only this one boundary; they can't shuffle money between seller-side recipients or zero one of them out. If the buyer is made whole, no seller-side recipient gets paid.
+- **Dispute.** Either party flips the state to `Disputed`, which resets the deadline to the mediation window, and the mediator decides each pool:
+  - **Price split:** what share of the price the buyer gets back. The rest goes to the seller-side recipients in their declared proportions. The mediator moves only this one boundary; they can't shuffle money between seller-side recipients or zero one of them out. If the buyer is made whole, no seller-side recipient gets paid. Shares are computed by floor division, and the remainder plus any share below the minimum box value fold into the seller's output, so a partial split always settles without dust outputs.
   - **Seller bond:** returned to the seller, or burned, depending on whether the seller acted in bad faith. It never flows to the buyer.
   - **Buyer bond:** returned to the buyer, or burned, depending on whether the dispute was filed in bad faith. It never flows to the seller.
 
@@ -90,7 +105,7 @@ So the mediator's allowed outputs are fixed: from the price pool, the buyer and 
 
 **Bonds: the reasoning.** Both bonds are deterrents rather than compensation, and each one is binary: it returns to its poster, or it burns on a bad-faith ruling. The seller bond discourages shipping nothing or shipping garbage. The buyer bond discourages a frivolous dispute, above all a condition complaint ("arrived damaged" or "not as described") backed by forged evidence, which is the one class of dispute that evidence can't cleanly settle. Each bond is the poster's only at-risk capital, so it has to be big enough that acting in bad faith is negative-EV against the named mediator (the sizing math for both sides is in [Appendix B](#appendix-b-escrow-economics)). A burned bond pays nobody, because paying the wronged party instead would hand every bond-less counterparty a positive return just for filing. Routing burned bonds to a public-goods wallet instead of destroying them still leaves a faint gravitational pull toward disputes resolving a particular way, so a clean burn is the more neutral deterrent. Bonds are **seller-set and optional**, never protocol-mandated, and sized to the trade.
 
-**The mutual-close predicate** handles all the in-between cases. If both parties sign, the contract accepts any distribution at all: a partial refund, a deadline extension (shipping got delayed, a return window left open), forwarding to a next milestone, or recreating the escrow with amended parameters. Recreation can even *add* value: if the buyer co-signs an extra funding input, the recreated box can hold more than the consumed escrow did (a scope upgrade or a budget increase mid-job). Otherwise the recreation path is guarded so it can only produce another valid escrow box of the same contract or a terminal settlement, never some arbitrary output. This is the general form of a rule that governs the whole escrow: **any action that strictly favors the other party can be done by one side alone** (seller refund, buyer confirm-received, the two timed exits), while **anything that moves the terms against a party needs both signatures.** The dispute door only comes into play when the two sides can't agree.
+**The mutual-close predicate** handles all the in-between cases. If both parties sign, the contract accepts any distribution at all: a partial refund, a deadline extension (shipping got delayed, a return window left open), forwarding to a next milestone, or recreating the escrow with amended parameters. Recreation can even *add* value: if the buyer co-signs an extra funding input, the recreated box can hold more than the consumed escrow did (a scope upgrade or a budget increase mid-job). Otherwise the recreation path is guarded so it can only produce another valid escrow box of the same contract or a terminal settlement, never some arbitrary output. This is the general form of a rule that governs the whole escrow: **any action that strictly favors the other party can be done by one side alone** (seller refund, buyer confirm-received, the two timed exits), while **anything that moves the terms against a party needs both signatures.** The dispute door only comes into play when the two sides can't agree. The exact per-door guard predicates are in [Appendix A](#appendix-a-full-transaction-examples).
 
 ```
                         SELLER
@@ -115,7 +130,7 @@ So the mediator's allowed outputs are fixed: from the price pool, the buyer and 
                                ┌─────────────┐
                                │   CLAIMED   │  silence → SELLER (timed release
                                └──────┬──────┘  after inspection_window)
-                                      │ either party may dispute (pauses clock)
+                                      │ either party may dispute (→ mediation clock)
               ┌───────────────────────┼───────────────────────┐
               ▼                       ▼                       ▼
             DOOR 1                  DOOR 2                  DOOR 3
@@ -132,7 +147,7 @@ So the mediator's allowed outputs are fixed: from the price pool, the buyer and 
         Receipt NFT → buyer  (reviews, warranty, tax records)
 ```
 
-A multi-stage state-machine pattern like this one already runs in **Bountiful** (StabilityNexus' bounty platform on Ergo): a creation → contribution → submission → judgment → withdrawal/refund flow, with judge multisig and a dispute period, all driven by State-NFT-guarded register transitions. It's worth studying as a reference implementation.
+A multi-stage state-machine pattern like this one already runs in [**Bountiful**](https://github.com/StabilityNexus/Bountiful-BountyPlatform-Ergo) (StabilityNexus' bounty platform on Ergo): a creation → contribution → submission → judgment → withdrawal/refund flow, with judge multisig and a dispute period, all driven by State-NFT-guarded register transitions. It's worth studying as a reference implementation.
 
 ## Choosing parameters
 
@@ -151,9 +166,9 @@ Both windows trade one party's headroom against the other's locked capital or ti
 
 **Sanity guardrails.** The contract enforces generous outer bounds on the economic parameters it reads. It rejects only the pathological cases (a zero `claim_by` that would refund before any seller could ship, a multi-year `inspection_window`) and never polices values that are merely suboptimal. The bounds are immutable and set wide enough that no honest trade ever hits them. A front-end should still recommend sane values inside them.
 
-**Timers are block-denominated.** Ergo has no native wall clock, so every window is a count of blocks, and real block time drifts with hashrate. Size the windows by dividing the target wall-clock duration by a *conservative-slow* block-time assumption, so drift can only ever make the real window longer than intended, never shorter than transit. That puts the failure on the recoverable side ("seller's capital locked a little longer") instead of the unrecoverable side ("buyer paid before the package could possibly arrive"). The rule that the dispute right runs the whole window is the backstop if a seller still sets transit too tight.
+**Timers are block-denominated.** Block height is the only manipulation-resistant clock; the pre-header timestamp exists but is miner-set and loosely bounded, so windows are counted in blocks, and real block time drifts with hashrate. Size each window by dividing the target duration by the shortest plausible block interval, which allocates the most blocks, so drift can only lengthen the real window, never shorten it below transit. That puts the failure on the recoverable side ("seller's capital locked a little longer") instead of the unrecoverable side ("buyer paid before the package could possibly arrive"). The rule that the dispute right runs the whole window is the backstop if a seller still sets transit too tight.
 
-> *Failure mode, buggy vs malicious interface.* The guardrails protect a buyer against a *buggy* front-end that skips validation. They do nothing against a *malicious* one that quietly routes the user to a different contract with the bounds stripped out, behind an identical-looking UI. The defense there is a wallet that checks the contract's ErgoTree hash against a known-good value before it signs.
+> *Failure mode, buggy vs malicious interface.* The guardrails protect a buyer against a *buggy* front-end that skips validation. A *malicious* front-end can't substitute a parameter-stripped escrow, since the listing contract pins the escrow hash and validates its terms on-chain. The residual is a front-end routing the buyer to a different *listing* contract behind an identical-looking UI, caught by checking the listing's ErgoTree hash before signing (see [Verification](#verification-the-client-library-and-the-wallet)).
 
 ## Listing options
 
@@ -165,7 +180,7 @@ On top of price and currency, a listing carries a handful of seller-set options 
 
 **Shipping cost** is usually baked into the listed price so the buyer sees a single number. For sellers juggling many shipping zones (per-region surcharges, customs), the listing references a shipping-rate Config Box, and the front-end resolves the buyer's region and shows the all-in price before purchase.
 
-**Concurrency and contention.** A box is spent by exactly one transaction, so two buyers going after the same listing in one block can't both win. This is per-listing rather than global, though: separate listings settle in parallel, so there's no throughput ceiling. For fungible inventory it never bites, because a bot composes one transaction that settles both buyers and re-creates the remainder, or the losing buyer just resubmits against the re-created box one block later. Only *unique* single-unit listings race, and there a losing Ergo transaction never lands at all, so the cost is a wasted wallet round-trip rather than gas or locked funds. Front-ends grey the listing out once they see a pending spend in the mempool.
+**Concurrency and contention.** A box is spent by exactly one transaction, so buyers hitting the same listing box in one block can't all win, and a self-replicating multi-unit listing is itself one box, so on its own it settles at most one sale per block. The ceiling is per-listing, not global: separate listings settle in parallel, so aggregate throughput is unbounded. A single hot listing needs a batching executor, which composes one transaction settling several buyers and re-creating the remainder, to clear more than one sale per block; cold inventory needs none, since a losing buyer just resubmits against the re-created box a block later. Because a fixed price has no spread to capture, that executor is paid by an explicit per-fill tip the buyer attaches or by a marketplace running it for its own listings, with competition pushing the tip toward execution cost (see [Bots, solvers & keepers](#bots-solvers--keepers)). A losing Ergo transaction never lands at all, so the cost is a wasted wallet round-trip rather than gas or locked funds. Front-ends grey the listing out once they see a pending spend in the mempool.
 
 **Purchase allowlist.** The base listing carries an optional `allowed_buyers` field. Empty means anyone can buy; non-empty restricts the purchase to those addresses. It's one field with two main uses. It can **reserve** a listing for a specific buyer by setting it to their address, for a pre-agreed or OTC sale, or **pause** a listing without delisting it by setting it to the seller's own address or a burn address, so nobody can buy while the seller is briefly unable to ship. The seller edits it whenever they want by spending and re-creating their own listing box, with no timer and no separate state involved. Because the seller controls it, it's revocable and doesn't *guarantee* any buyer the item. A single buyer or a self-pause is stored inline; a large set (a community's members, say) is stored as an AVL+ root, with the buyer proving membership at purchase.
 
@@ -188,7 +203,7 @@ Listing-type boxes share a register convention so any compatible tool can read a
 | R4 | Owner_PK | The seller. (For purely on-chain assets a bid is symmetric, a buyer's box is just a seller of currency, so the same field serves; physical listings are seller-only, see note.) |
 | R5 | (Offered_TokenID, Offered_Amount, Optional_Min_Fill) | What the box locks. Min-fill prevents dust-sized partial fills. |
 | R6 | (Wanted_TokenID, Wanted_Amount) | What the owner wants. For physical listings the wanted-token is the currency. |
-| R7 | Metadata_Blob | A single `Coll[Byte]` the contract never reads: a leading `schema_version` byte followed by self-describing tag-length-value entries (title, short description, condition grade, category, GTIN/ISBN/identifier, brand, …). Readers skip unknown tags; a listing carries only the fields it has. The tag registry lives in the EIP, not the contract, so new fields and new categories need no contract or register-layout change. |
+| R7 | Metadata_Blob | A single `Coll[Byte]` the contract never reads: a leading `schema_version` byte followed by self-describing tag-length-value entries (title, short description, condition grade, category, GTIN/ISBN/identifier, brand, …). Readers skip unknown tags; a listing carries only the fields it has. The tag dictionary lives in the EIP, not the contract, so new fields and new categories need no contract or register-layout change. |
 | R8 | Mode_Specific | For escrow listings: `claim_by` and `inspection_window` durations, seller-bond and buyer-bond requirements. For auctions: auction parameters, oracle references. Shipping zones where used. Depends on the contract. |
 | R9 | (Contract_Extras, Price_Distribution, Optional_IPFS_Hash) | Mediator spec for escrow flows, encrypted payloads, and the price-distribution list of `(address, share)` pairs (empty or single-entry means seller takes all). The IPFS hash references extended metadata (images, long-form description, spec sheets, PDFs). |
 
@@ -201,11 +216,11 @@ That's the *listing* convention. After purchase the **escrow box** is a differen
 | R6 | (Wanted_TokenID, Wanted_Amount) | (state, deadline) |
 | R7 | Metadata_Blob (TLV) | (currency_id, price, seller_bond, buyer_bond) |
 | R8 | Mode-specific (timers, bonds, zones) | (inspection_window, price_distribution) |
-| R9 | (Extras, Price_Distribution, IPFS_hash) | (listing_ref, ECIES_encrypted_buyer_handle) |
+| R9 | (Extras, Price_Distribution, IPFS_hash) | (listing_ref, ECIES_encrypted_contact_handle) |
 
-Since the one `deadline` field gets reused across states, a reader checks `state` to know how to read it: in `Active` it's the `claim_by` long-stop, in `Claimed` it's the inspection-window expiry, and in `Disputed` it's the mediation deadline. Full layouts are in [Appendix A](#appendix-a-full-transaction-examples).
+Since the one `deadline` field gets reused across states, a reader checks `state` to know how to read it: in `Active` it's the `claim_by` long-stop, in `Claimed` it's the inspection-window expiry, and in `Disputed` it's the mediation deadline. The escrow's State NFT lives in the box's token list rather than a register, so the register layout is unchanged; the successor box on every transition must preserve the NFT, the script, and the box value. Full layouts are in [Appendix A](#appendix-a-full-transaction-examples).
 
-Putting the searchable text on-chain in the R7 blob, instead of behind an IPFS hash, keeps indexers cheap and resilient. The storage rent on a few hundred extra bytes is negligible and well worth the indexing benefit. The contract treats R7 as opaque bytes; only indexers and front-ends parse it, following the EIP's tag registry, which should build on the established Schema.org Product vocabulary instead of reinventing one. The R9 hash is optional and meant for bulk content (images, long-form description, spec sheets, PDFs), and listings without any leave it empty.
+Putting the searchable text on-chain in the R7 blob, instead of behind an IPFS hash, keeps indexers cheap and resilient. The storage rent on a few hundred extra bytes is negligible and well worth the indexing benefit. The contract treats R7 as opaque bytes; only indexers and front-ends parse it, following the EIP's tag dictionary, which should build on the established Schema.org Product vocabulary instead of reinventing one. The R9 hash is optional and meant for bulk content (images, long-form description, spec sheets, PDFs), and listings without any leave it empty. Registers must be packed contiguously from R4 up, so a trailing register like R9 can be left empty but a middle one can't, which is why optional fields fold into an existing register's tuple rather than taking a register that might be blank.
 
 Tooling that only displays or indexes a listing reads R4–R7 from any conforming box. R8–R9 are interpreted per contract; the contract is identified by its ErgoTree hash (the box's guard script), which is what the box's address derives from. That keeps the universal part small and stable while letting each contract use the remaining registers however it needs.
 
@@ -213,9 +228,9 @@ Tooling that only displays or indexes a listing reads R4–R7 from any conformin
 
 **Listing lifecycle and cleanup.** A listing carries a seller-set `listing_deadline` (R8). The seller can delist or renew at any time by spending the box back to themselves. Once the deadline passes, anyone can spend the box through a constrained **cleanup spend** that returns its full contents (the locked ERG and any bonded tokens) to the seller, minus a small capped keeper reward for whoever submits it. This is the "graceful expiry" pattern seen across Ergo order and auction contracts: the keeper bounty keeps cleanup reliable, and the seller's capital comes back rather than getting confiscated. Storage rent is the slow backstop underneath all this (a box nobody touches eventually becomes reclaimable by a miner), but the contract deadline is the fast, intended path.
 
-One protocol fact this has to respect: **storage rent is paid only in ERG, and tokens can't pay it.** A listing or escrow box holding a *token* bond (a stablecoin, say) with only minimal ERG can, once the rent period is up, be consumed by a miner, which takes the bonded tokens along with it. So any token-bonded box needs an ERG buffer sized to its intended lifetime (a few ERG covers decades). Front-ends set this, and the cleanup spend returns it together with the bond. Boxes that hold ERG bonds protect themselves.
+One protocol fact this has to respect: **storage rent is paid only in ERG, and tokens can't pay it.** A *listing* box holding a *token* bond (a stablecoin, say) with only minimal ERG can, once the four-year rent period is up, be consumed by a miner, which takes the bonded tokens along with it. So a token-bonded listing needs an ERG buffer sized to its listing lifetime (a few ERG covers decades), which front-ends set and the cleanup spend returns together with the bond. An ERG-bonded listing protects itself. The escrow box needs no such buffer: it is guaranteed to reach terminal settlement within its deadlines, well inside the rent period, so the box minimum is enough whether it holds a token bond or the State NFT.
 
-**Many contract versions, one interface.** A deployed contract's code is immutable, and each listing is its own box guarded by that contract's logic, with no EVM-style "deployment" event anywhere. A contract is identified by its ErgoTree hash, and two boxes with the same ErgoTree share an address. So the "protocol" is really a growing family of contracts identified by hash: an improved version gets a new hash and address, existing boxes keep working until they're spent, and tooling handles both as long as they share the register interface. Nothing is welded into a monolithic core, because there's no core to weld it into. The discipline that keeps this working: keep contracts narrow and well-tested, deploy new versions freely, and maintain the register interface across versions.
+**Many contract versions, one interface.** A deployed contract's code is immutable, and each listing is its own box guarded by that contract's logic, with no EVM-style "deployment" event anywhere. A contract is identified by its ErgoTree hash, and two boxes with the same ErgoTree share an address. So the "protocol" is really a growing family of contracts identified by hash: an improved version gets a new hash and address, existing boxes keep working until they're spent, and any tool can read both through the register convention, while front-ends and indexers recognize the versions they choose (see [type standards](#discovery-type-standards)). A listing contract pins its paired escrow contract by that hash, so the two move together and a new escrow version ships as a new (listing, escrow) pair. The escrow script holds no per-trade constants, so every escrow instance shares one hash and address. Nothing is welded into a monolithic core, because there's no core to weld it into. The discipline that keeps this working: keep contracts narrow and well-tested, deploy new versions freely, and maintain the register interface across versions.
 
 > *Failure mode, immutable bugs.* A bug in a deployed contract is permanent for anyone using it. Testnet stress-testing reduces the odds but can't eliminate them, and the only remedy is voluntary migration to a fixed version, which some users won't do. Old listings on a buggy contract can't be repaired after the fact.
 
@@ -227,15 +242,15 @@ The family at a glance, with what each one reuses:
 
 | Contract | Status | Purpose | Ergo prior art |
 |----------|--------|---------|----------------|
-| Atomic swap (+ partial fill) | reuse existing | On-chain token/NFT trade | Spectrum, NFT marketplaces |
+| Atomic swap (+ partial fill) | reuse existing | On-chain token/NFT trade | Spectrum, [SkyHarbor](https://github.com/skyharbor-market/contracts) |
 | Fixed-Price+Escrow | build, v0 | Mediated physical/service trade | Bountiful state-machine pattern |
 | Fixed-Price-Multi-unit+Escrow | build, post-v0 | Multi-unit inventory, one escrow per unit | shares escrow interface |
 | Fixed-Price-Tiered+Escrow | proposed | Bulk-discount variant | shares escrow interface |
-| English auction | reuse existing | Price discovery | EIP-22 |
+| English auction | reuse existing | Price discovery | [Ergo Auction House](https://github.com/anon-real/ErgoAuctionHouse), EIP-22 |
 | Dutch auction | proposed | Simpler price discovery | order-book patterns |
 | Sealed-bid (Vickrey) | proposed | Private price discovery | Sigma commit-reveal |
 
-They all share the register interface, so one indexer reads every one of them, and new hashes can be added to a registry at any time without disturbing live boxes.
+They all share the register interface, so one indexer reads every one of them, and new contract hashes can be recognized at any time without disturbing live boxes.
 
 ### Auctions
 
@@ -260,7 +275,7 @@ The eUTXO model needs bots for two reasons. First, when several users want to sp
 
 What bots do: **concurrency batching** (combine intents against shared state), **multi-party matching** (stitch sell boxes, buy boxes, and external pools into one settlement, including non-monetary barter rings), **cross-DEX liquidity** (source fills from Spectrum and other AMMs and take the spread), **cleanup** (submit the cleanup spend on expired listings to claim the keeper reward), and **time-keeping** (trigger a timed release or timed refund once an escrow's deadline passes, and settle auctions at end-block). The chain has no autonomous clock on its own, so a keeper triggering the spendable-after-timer outcome is exactly what lets neither party have to babysit the trade.
 
-**How bots get paid:** for matching and batching, a listing specifies a minimum acceptable output to the owner and the bot keeps whatever surplus is left (the bid/ask spread, or the fees saved by batching). Time-keeping and cleanup produce no surplus, so they're paid by a small keeper bounty baked into the box (claimable dust-ERG), or run for free by a marketplace as table stakes for its own listings. Competition drives margins down toward transaction fee plus overhead, and the edge is latency, completeness, and specialization, so no operator holds onto large rents while running a bot stays profitable even at modest volume. Reference implementations should be open source to keep the entry threshold low. **Spectrum Finance** is one production precedent: anyone can run an executor bot, off-chain matchers build the multi-input transactions, and execution fees spread across miners, UI providers, executors, and LPs, all of it permissionless.
+**How bots get paid:** for matching and batching, a listing specifies a minimum acceptable output to the owner and the bot keeps whatever surplus is left (the bid/ask spread, or the fees saved by batching). Time-keeping and cleanup produce no surplus, so they're paid by a small keeper bounty baked into the box (claimable dust-ERG), or run for free by a marketplace as table stakes for its own listings. Competition drives margins down toward transaction fee plus overhead, and the edge is latency, completeness, and specialization, so no operator holds onto large rents while running a bot stays profitable even at modest volume. Reference implementations should be open source to keep the entry threshold low. [**Spectrum Finance**](https://github.com/spectrum-finance/ergo-dex) is one production precedent: anyone can run an executor bot, off-chain matchers build the multi-input transactions, and execution fees spread across miners, UI providers, executors, and LPs, all of it permissionless.
 
 ---
 
@@ -310,7 +325,7 @@ The soft spot: in the low-value used-goods case, the standby fee removes the per
 - **Sustained collusion (pattern):** the same pairing across many disputes, with outcomes that lean the same way every time. It can only be caught in aggregate, with reputation services watching the dispute graph, and it's hard to spot from any single trade.
 - **Bribery during a dispute:** a long-running mediator has public reputation on the line, which raises the price of bribery without removing it. Open rule sets and published records make the outliers stand out.
 - **Stolen mediator key:** the damage is capped, since the attacker can only redistribute between buyer and seller, never to an arbitrary address. The fallback mediator, the mediation deadline, and the inspection-window timed release all cap the exposure further.
-- **Coordinated mediator unavailability:** if every chosen mediator goes offline (takedown, key loss, mass abandonment), or none of them rules before the mediation deadline, the trade drops to the breakdown fallback and refunds the buyer, who carried the loss-of-funds risk during shipping. The fallback can't favor both sides at once, and favoring the buyer matches the pre-claim default. *There's no clean fix here: it trades a stuck seller's payment for a buyer's recovery when the mediation layer fails.*
+- **Coordinated mediator unavailability:** if every chosen mediator goes offline (takedown, key loss, mass abandonment), or none of them rules before the mediation deadline, the trade drops to the breakdown fallback and refunds the buyer, who carried the loss-of-funds risk during shipping. The fallback can't favor both sides at once, and buyer-favor is also the only side a malicious party can't engineer: since the seller curates the accepted mediator set, a seller-favorable timeout could be manufactured by stacking the set with absent mediators, claiming shipment, and waiting it out, so favoring the buyer makes mediator absence unprofitable to fake. *The residual cost is the honest seller whose mediators fail for real: there's no clean fix, it trades that seller's payment for a buyer's recovery when the layer fails.*
 
 Detecting the collusion cases comes down to cluster analysis: shared funding sources, simultaneous activity, identical IPFS pinning. Curated pools and high-value panels (below) are the main structural mitigations. None of it is perfectly preventable, which is a basic limit of any mediated system.
 
@@ -326,7 +341,7 @@ The obvious question, after all that mediator machinery, is whether the mediator
 
 Three things follow, and together they make MAD both weaker and more capital-hungry than mediated escrow. First, **MAD has no recovery path**: the deposit *is* the whole mechanism, so a wronged honest party just eats the loss, where mediated escrow can adjudicate the disputed funds back to them. Second, and because of that, **MAD needs larger bonds to deter at all.** With no recovery, the deposit alone has to make a scam negative-EV, which (per the threshold math) takes a deposit on the order of the item's full value; a mediated bond only has to tip the EV given that adjudication already claws most of the value back, so it can be a fraction of the price. So MAD locks up more capital to buy less protection. Third, **MAD destroys value with positive probability even between non-malicious parties**, because its honest equilibrium is unstable, where escrow bonds come back almost every time and burn only on an adjudicated bad-faith ruling, never on a plain coordination failure.
 
-**Where it might still fit:** very low-value trades where a mediator fee would cost more than the item; repeated trades inside communities, where the reputation cost amplifies the deposit's deterrent; or as a configurable fallback for when chosen mediators go silent. Anyone deploying a MAD-style contract should say plainly that its security is psychological rather than mathematical. The protocol doesn't stop such a contract from being deployed and registered. It just shouldn't be the default for trade between strangers.
+**Where it might still fit:** very low-value trades where a mediator fee would cost more than the item; repeated trades inside communities, where the reputation cost amplifies the deposit's deterrent; or as a configurable fallback for when chosen mediators go silent. Anyone deploying a MAD-style contract should say plainly that its security is psychological rather than mathematical. The protocol doesn't stop such a contract from being deployed and recognized. It just shouldn't be the default for trade between strangers.
 
 ## Evidence & delivery verification
 
@@ -344,13 +359,13 @@ For a *disputed* trade the mediator already acts as the delivery attester, query
 
 The settlement transaction can optionally mint a small NFT to the buyer (a Receipt NFT, around 0.001 ERG). The protocol does nothing else with it; its value is whatever other systems decide to do with it. It answers one question: **how does a future contract, service, or person verify that this wallet really bought this item?**
 
-Using the issuer-box pattern, minting the receipt in the same transaction that closes a specific escrow ties the receipt to *that trade*, and through it back to the originating listing. So the receipt says more than "buyer of this seller." It says "buyer in *this specific trade*," and it says it cryptographically.
+Using the issuer-box pattern, minting the receipt in the same transaction that closes a specific escrow ties the receipt to *that trade*, and through it back to the originating listing. The closing transaction is also the one that burns the escrow's State NFT, so the receipt mint and the escrow's end are a single token-lineage fact rather than a tx-graph inference. So the receipt says more than "buyer of this seller." It says "buyer in *this specific trade*," and it says it cryptographically.
 
 Downstream uses: **reviews** limited to receipt-holders (see [Reviews](#reviews)); **warranties and returns**, which in practice are *policy promises* by the seller, since locking seller funds for a multi-month warranty window would tie up too much capital, where the buyer presents the receipt through the seller's channel or a mediated process and reputation enforces compliance; and **tax, accounting, and expense documentation**, a permanent timestamped signed record that front-ends can render as a printable invoice. Receipts are opt-in at purchase. They're worth it for valuable trades and after-sale relationships and overkill for cheap fungibles, so front-ends can default the toggle by category.
 
 ## Reputation
 
-The protocol doesn't compute reputation. It just emits the raw record. Reputation here is mainly about the two roles running ongoing businesses, sellers and mediators. Every settled escrow is permanent, so lifetime volume, dispute rate, average resolution time, and fees paid can all be read off the chain. Reputation services are what turn that history into metrics.
+The protocol doesn't compute reputation. It just emits the raw record. Reputation here is mainly about the two roles running ongoing businesses, sellers and mediators. Every settled escrow is permanent, so lifetime volume, dispute rate, average resolution time, and fees paid can all be read off the chain. Reputation services are what turn that history into metrics. Beyond derived trade history, reputation can be supplied as explicit on-chain attestations. [**reputation-systems**](https://github.com/reputation-systems/reputation-system) is an early Ergo reference for this: anyone issues signed opinions about a subject, weighted by committed stake, which front-ends weight or ignore.
 
 Reputation is a competitive layer. In practice the natural shape is **reputation aggregators**: a few services combine on-chain history, off-chain attestations, and KYC tier into composite scores, and front-ends consume one or more of them. Users rarely curate their own trust lists. They pick a front-end and inherit its choices, which makes the front-end the accountable unit, since it aggregates several services plus its own metric and, unlike a pure rater, has users and a business to lose when trust breaks.
 
@@ -368,11 +383,11 @@ A worse variant is theft. If one key both signs and re-delegates, a stolen key l
 
 > *Failure mode, selling the identity as an exit.* Free transferability means a reputable identity can be sold to a scammer planning one big extraction, and the protocol has no way to treat ownership changes as meaningful. The defense sits entirely at the reputation layer: services drop trust after a long-running identity changes hands until the new holder builds history; front-ends show ownership history next to the metric; and high-stakes interactions can require an off-chain identity check that doesn't move with the NFT.
 
-## Discovery: federated registries
+## Discovery: type standards
 
-A registry box is a singleton holding a list of valid contract hashes, basically a phone book for the protocol. Bots and front-ends subscribe to whichever registries they trust and scan those addresses for listings.
+A **type standard** is an on-chain type NFT: a single-supply, immutable box holding a standard's name, description, and schema URI, with no operator once minted. A listing or contract references the type NFT to declare conformance, and a transaction that must check it includes the type as a read-only data input. Front-ends and indexers recognize whichever types they choose and scan the contract hashes that implement them. A widely recognized type becomes the de facto standard, the way everyone converges on one token ID, and anyone can mint a competing one freely.
 
-**Anyone can publish a registry.** A conservative one lists only audited contracts, an experimental one lists betas, a niche one lists category-specific contracts, and a community one lists whatever gets submitted. That pushes the censorship decision out to the edges. Upgrading a contract just means deploying the new version and adding its hash to a registry; subscribers pick it up, and old listings stay on the old contract.
+Because the type is operator-less and immutable, there is no directory to capture or take down. Recognition lives at the edges: a conservative front-end recognizes only audited types, a niche one recognizes a category, and a shared recommendation can travel as an off-chain community list any front-end adopts or ignores. That puts the censorship decision out at the edges. Upgrading means publishing a new contract version under the same type; old listings stay on the old contract until spent.
 
 > *Failure mode, spam.* Curation filters what a front-end *displays*, but spam boxes still exist and still burden every indexer that has to ingest and exclude them. The per-box minimum ERG is the creation deterrent, though it's small; listing-deadline cleanup and storage rent then clear the boxes out over time. A one-time flood imposes a parse-and-filter cost until cleanup catches up, and marketplaces add reputation filters and minimum-bond-to-list rules on top (their policy, not the protocol's). Spam is made costly to create and finite in lifetime, not free to ignore.
 
@@ -390,6 +405,20 @@ Multiple review systems run in parallel. Each front-end picks which ones to disp
 
 The chain's guarantees stop at settlement. Everything in this layer depends on off-chain reality, humans with discretion, or market dynamics, so it's best-effort by nature, and the three [core open problems](VISION.md#the-hard-parts) never fully close. The generous-protocol, ruthless-application stance that follows from all this is laid out in [VISION.md](VISION.md), and the incentive gaps in between are real design work this project owns rather than someone else's problem. The [honest accounting](#honest-accounting) section adds up where that leaves the design overall.
 
+One row per role: what each is relied on for, the worst it can do if it turns, and what bounds the damage. None of these roles is the protocol itself.
+
+| Role | Trusted for | Worst it can do | Bounded by |
+|------|-------------|-----------------|------------|
+| **Contracts / chain** | Atomic settlement; funds exit only through allowed paths; listing terms unbreakable | A permanent bug strands or misroutes funds | Pre-deployment testing; a bug is fixed only by migrating to a new contract, never retroactively |
+| **Wallet** | Showing the true transaction before signing, and running the library's checks at the signing boundary where it supports them | Sign anything on the user's behalf, or show a false summary | The user's own installed software, open-source and reproducible; the true-transaction display is the floor even without contract awareness |
+| **Mediator** | An honest price split and honest bad-faith calls on the bonds in a dispute | A corrupt-but-legal ruling can cost a victim the price plus their bond | Hard-capped outputs (buyer / fixed seller-side / burn only), mutual handshake, appeal tier, reputation |
+| **Counterparty** | Off-chain delivery (seller) or honest receipt (buyer) | Scam: never ship, or fake a defect | Bond, mediator, reputation, timed exits |
+| **Client library** | Building correct transactions and decoding the true box state shown to the user | A bug builds a malformed transaction or misreads a box | Open-source, reproducible builds, one audited code path shared by every front-end, bot, and light client |
+| **Front-end** | Discovery, curation, presentation, and recommending the mediator and trade parameters (bonds, timers) for each trade | Bias the user's selection, hide listings, or steer toward a weak mediator or bad terms | Competing front-ends; what gets signed is built by the client library and verified before signing, so a captured front-end cannot show one box and sign another |
+| **Indexer** | Completeness and freshness of listings shown | Omit or stale a listing | Running an independent indexer or a light client; on-chain verification before signing |
+| **Reputation service** | Accuracy of metrics | Steer a user to a bad trade with a wrong metric | Per-trade escrow and bond protect the buyer regardless of metric; use several services |
+| **Type / discovery source** | Which listing and contract types a front-end or indexer recognizes and surfaces | Recognize a malicious look-alike contract | The contract enforces its own output constraints however it was found, and the ErgoTree hash is verified before signing; recognize several, all operator-less |
+
 ---
 
 # Connective systems
@@ -400,7 +429,7 @@ The plumbing that links on-chain settlement to the trust layer and to the wider 
 
 The protocol supports any currency a token can represent. The notable options: **ERG**; **USE** and **SigUSD** (Ergo-native stablecoins, and the better default for listings); **bridged stablecoins** (via Rosen Bridge); and **bridged crypto** (rsETH, rsADA, rsBTC). A seller lists a single offer in their preferred currency and a buyer can pay in another, because bots route the buyer's currency through DEX pools into the seller's receive currency in one transaction, so there's no need for duplicate listings. Routing carries pool-rate risk, so the buyer should see a max-slippage bound before signing.
 
-**Babel fees (EIP-31)** let users pay transaction fees in any token they already hold. Providers supply the ERG at a small spread, so a buyer holding only USE doesn't have to go acquire ERG just to make a purchase. CyberVerse is one production reference, where players pay for everything in CYPX and touch zero ERG.
+**Babel fees (EIP-31)** let users pay transaction fees in any token they already hold. Providers supply the ERG at a small spread, so a buyer holding only USE doesn't have to go acquire ERG just to make a purchase. The [Fleet SDK babel-fees plugin](https://github.com/fleet-sdk/fleet) implements EIP-31 directly, so a client can build fee-in-token purchases out of the box.
 
 **ChainCash** is a note-based monetary protocol on Ergo. Notes can be issued on trust, fully reserve-backed, or anywhere in between, and they circulate off-chain through a signature custody chain, with on-chain redemption against any prior signer's reserve. For the marketplace, a community can use its own notes as the listing currency and only settle on-chain at redemption. The payoff is the liquidity of mutual credit, which is useful for B2B trade where counterparties extend each other credit instead of pre-funding every transaction.
 
@@ -410,12 +439,12 @@ The protocol supports any currency a token can represent. The notable options: *
 
 For most trades, the established external apps are the right call (Signal, Telegram) for the rich media, threading, push, and group chat that on-chain messaging can't match right now. The protocol just provides the handshake that bootstraps any such channel:
 
-- **ECIES handshake.** At purchase the buyer encrypts their contact handle to the seller's public key and writes the ciphertext into the escrow box's R9, and the seller's wallet decrypts it and starts contact. There's no need for the reverse direction: a buyer who wants to reach the seller first can use the public listing channel, and the seller verifies the buyer's identity once contact is made.
+- **ECIES handshake.** At purchase the buyer encrypts their contact handle to the seller's public key and writes the ciphertext into the escrow box's R9, and the seller's wallet decrypts it and starts contact. There's no need for the reverse direction: a buyer who wants to reach the seller first can use the public listing channel, and the seller verifies the buyer's identity once contact is made. The handle is the one item that sits permanently on-chain under the seller's static key, so buyers should use a rotating or purchase-specific handle, the same hygiene as the fresh-address default, which keeps a later key leak from linking their purchases. The shipping address never goes on-chain; it travels over the off-chain channel (see [Privacy](#privacy)).
 - **Identity verification (EIP-28, `ergo.auth()`).** A nonce-based sign-message flow (supported by Nautilus) confirms that the chat counterparty owns the on-chain address, which closes the impersonation gap that plagues OTC chats.
 
 This isn't only buyer↔seller. The same handshake extends to a mediator during a dispute (see [Mediators](#mediators)).
 
-**On-chain encrypted communication** is also possible, since both wallets are keypairs anyway, and it brings properties chat apps don't have (tamper-evident timestamps, censorship resistance, no third-party server), at the cost of being slower. **Ephemeral Messenger** (qx) is a working reference: on-chain encrypted messages with a configurable lifetime, where any third party can burn an expired message-box for the locked ERG. Off-chain apps are the right call for now and for most trade, but on-chain messaging is plausibly the cleaner long-term integration, since the same key that trades can carry the conversation with no third-party server in the path. It's worth standardizing wallet support for at least one channel so that "buy" → "open chat" is a single click.
+**On-chain encrypted communication** is also possible, since both wallets are keypairs anyway, and it brings properties chat apps don't have (tamper-evident timestamps, censorship resistance, no third-party server), at the cost of being slower. [**Ephemeral Messenger**](https://bafkreibqyazalnfuw7ojlwtahsjoijgxqv2eq4dcgyfnfc4ati2k4mihbm.ipfs.inbrowser.link/) (qx) is a working reference: on-chain encrypted messages with a configurable lifetime, where any third party can burn an expired message-box for the locked ERG. Off-chain apps are the right call for now and for most trade, but on-chain messaging is plausibly the cleaner long-term integration, since the same key that trades can carry the conversation with no third-party server in the path. It's worth standardizing wallet support for at least one channel so that "buy" → "open chat" is a single click.
 
 ## Privacy
 
@@ -445,21 +474,27 @@ Explicitly not part of the core. The protocol imposes none of it, and different 
 
 ## Front-ends & curation
 
+A front-end is a thin client over the [client library](#architecture-overview): the library builds every transaction and decodes the box state the user sees, and the front-end adds presentation, discovery, and curation on top.
+
+**Hosting.** A front-end hosts itself however it likes. For the reference and fallback path, content-addressed deployment (IPFS or similar) is recommended: it removes the single takedownable site, and the content hash pins the exact audited build, so confirming the client library is genuine is a one-time CID check (see [Verification](#verification-the-client-library-and-the-wallet)). The tradeoffs are gateway latency, ongoing pinning, static-only scope (an optional indexer or fiat proxy still needs a destination), and a friendly name still being a mutable pointer someone controls, so the fully trustless path pins a specific build. Commercial front-ends will mostly use ordinary hosting, which changes how reachable they are and nothing about what they can do to a signed trade.
+
 **What a front-end provides:** wallet connection; browse and search through an indexer; item pages with images, specs, and history; a sell flow (barcode scan → API auto-fill → mint listing); a buy flow with escrow-status visualization; a dispute UI; order history and receipt rendering; receipt-backed reviews; reputation visualization pulled from one or more services; and comparable-listings views with price history for items that have stable identifiers.
 
-**Curation** is where the same on-chain listings get presented in different ways. A premium front-end shows only verified sellers and runs an in-house mediator team; a general one shows most listings with warning labels on the unverified ones; a raw one shows everything from every registry; a niche one shows a single category; a local one shows local-pickup listings in one city. Each defines "verified" however it likes, and none of them has any privileged protocol access. A front-end should label a low-bond or no-bond listing as such, so the buyer can weigh a lightly-bonded listing from an established seller against a well-bonded one from a fresh account, which is the real choice in front of them.
+**Curation** is where the same on-chain listings get presented in different ways. A premium front-end shows only verified sellers and runs an in-house mediator team; a general one shows most listings with warning labels on the unverified ones; a raw one shows everything it can find; a niche one shows a single category; a local one shows local-pickup listings in one city. Each defines "verified" however it likes, and none of them has any privileged protocol access. A front-end should label a low-bond or no-bond listing as such, so the buyer can weigh a lightly-bonded listing from an established seller against a well-bonded one from a fresh account, which is the real choice in front of them.
 
-> *Failure modes, application layer.* **Curation monopoly:** network effects push users toward whichever front-end has the best curation and the largest selection, and the protocol preserves the *option* of competing front-ends but can't stop one from dominating. **Front-end manipulation:** a dominant front-end can bias search toward sellers who pay for placement, or bury listings that make it look bad; only competing front-ends correct that, and only if users bother to switch. The claim here is conditional. Because listings and reputation are portable shared record, the capture risk is *lower* than on a traditional platform, but only as long as the wallet (below) holds transaction integrity. If users sign whatever a web app hands them, a captured front-end is just as dangerous here as anywhere else. With the wallet doing its job, capture shrinks from *what the user signs* (wallet-guaranteed) down to *which listings they see* (discovery bias), and at that point the cheap switch to a competitor showing the same listings is the real check.
+> *Failure modes, application layer.* **Curation monopoly:** network effects push users toward whichever front-end has the best curation and the largest selection, and the protocol preserves the *option* of competing front-ends but can't stop one from dominating. **Front-end manipulation:** a dominant front-end can bias search toward sellers who pay for placement, or bury listings that make it look bad; only competing front-ends correct that, and only if users bother to switch. The claim here is conditional. Because listings and reputation are portable shared record, the capture risk is *lower* than on a traditional platform, but only as long as what actually gets signed is built and checked below the front-end. If users sign whatever a web app hands them blind, a captured front-end is as dangerous here as anywhere. With that integrity in place, capture shrinks from *what the user signs* down to *which listings they see* (discovery bias), and at that point the cheap switch to a competitor showing the same listings is the real check.
 
-## Wallet: the trusted computing base
+## Verification: the client library and the wallet
 
-Trust should sit in the wallet rather than the front-end, and most of the front-end-as-adversary surface closes once the wallet does its job. It's the single most important non-contract component in the system. A supporting wallet should:
+The [client library](#architecture-overview) is the one reference implementation of the checks below; how much they protect depends on where they run. The floor, on any wallet today, is the signing screen showing the true transaction (destinations, ERG, tokens), which catches funds routed anywhere other than the escrow contract, though a plain wallet does not decode the contract or mediator. The readable, contract-aware checks run in the in-page library and hold against a hostile front-end only when the served code is pinned (subresource integrity, or a content-addressed front-end). The long-term home is an existing wallet running them natively, or a thin verifier extension: a trust domain the page cannot tamper with, adding no per-trade step.
 
-- **Show the real box, not the front-end's version of it.** Parse the transaction about to be signed and display the true price, bonds, timers, named mediator, and recipients read straight from the box, so a front-end can't show one thing and build another.
-- **Verify the contract.** Check the ErgoTree hash against a known-good registry before signing, and warn on a mismatch or an unrecognized contract.
-- **Encrypt the shipping address locally.** Do the ECIES encryption of the address to the seller's key inside the wallet, so the front-end never touches plaintext. That's the difference between a front-end that *sees* every address and one that never sees a single one.
-- **Check the named mediator** against reputation services before signing, and warn if it's unknown, fresh, or poorly rated.
-- **Surface escrow state and timers.** Show open escrows with their state (`Active` / `Claimed` / `Disputed`), the time left on the current timer, the counterparty, and the mediator; decrypt incoming shipping handles; sign confirm-received, shipping-claim (with optional tracking), refund, and dispute transactions; and remind both parties as each timer gets close to expiring.
+The checks:
+
+- **Show the real box.** Parse the transaction about to be signed and display the true price, bonds, timers, named mediator, and recipients read straight from the box, so the displayed terms match what gets built.
+- **Verify the contract.** Check the ErgoTree hash against a known-good set before signing. At purchase the load-bearing check is the *listing* contract, which pins the escrow contract on-chain, so verifying one hash covers both. Later escrow spends (a mediator ruling, a keeper release) verify the escrow hash directly. Warn on a mismatch or an unrecognized contract.
+- **Encrypt the shipping address.** Send it over the communication channel, and don't leave a long-lived ciphertext of it under the seller's static key on-chain, whether in a register or a static-key message box, since chain history is permanent and a later key leak would expose every past buyer's address. (The contact handle is the deliberate low-sensitivity exception, mitigated by rotation; see [Communication](#communication).) An off-chain channel avoids this inherently; an Ergo-native channel matches only if its session keys are forward-secret. Encrypt at the signing boundary (wallet or extension) so the front-end never touches plaintext; in-page encryption guards only against a careless front-end, since a hostile page can read the address before encryption. The address still reaches whoever ships regardless, the separate unavoidable leak of [hard-part #3](VISION.md#the-hard-parts).
+- **Check the named mediator** against reputation services before signing, and warn if it is unknown, fresh, or poorly rated.
+- **Surface escrow state and timers.** Show open escrows with their state (`Active` / `Claimed` / `Disputed`), the time left on the current timer, the counterparty, and the mediator; decrypt incoming contact handles; sign confirm-received, shipping-claim (with optional tracking), refund, and dispute transactions; and remind both parties as each timer nears expiry.
 - **Handle the currency plumbing.** Show multi-currency balances, generate a fresh derived address per purchase by default, and handle babel fees behind the scenes.
 
 ## Monetization
@@ -480,15 +515,15 @@ The **price-distribution mechanism** ([defined above](#mediated-escrow)) is one 
 
 A free protocol doesn't mean a free *quality* marketplace. Curation (vetting, support, moderation) is funded by the same open-base, unforkable-service logic that funds reputation: a fee-less fork gets the code but not the live vetting pipeline, the brand, the support org, or the domain expertise, and revenue scales with the volume good curation pulls in, so a cheap, thin front-end stays a niche player rather than a market-killer.
 
-**Funding the commons.** Value capture funds the *businesses*. How the shared base beneath them (audited contracts, the EIP, an open indexer, wallet support) gets funded is a positioning question covered in [VISION.md](VISION.md#the-economic-model). One build-time note belongs here: wallet support should ride on an existing wallet rather than fund a brand-new one, which folds the one genuinely ongoing cost into infrastructure that already exists.
+**Funding the commons.** Value capture funds the *businesses*. How the shared base beneath them (audited contracts, the EIP, an open indexer, wallet support) gets funded is a positioning question covered in [VISION.md](VISION.md#the-economic-model). One build-time note belongs here: the readable verification ships in the client library, so wallet support means an existing wallet (or a thin verifier extension) adopting those checks, with no new wallet to fund.
 
 ## Light clients
 
-The architecture assumes most users go through a front-end talking to an indexer, which is the pragmatic path: fast, familiar, browser-friendly. It also concentrates trust, though: if the indexer lies or the front-end gets taken down, users with no alternative are stuck. (This is a later-phase upgrade rather than part of the core, but the protocol should emit clean events early so it stays possible.)
+Most users go through a front-end talking to an indexer, which is the fast, familiar path. It concentrates trust: if the indexer lies or the front-end gets taken down, a user with no alternative is stuck. The fallback is the same [client library](#architecture-overview) with its box-finder pointed at a node instead of an indexer, so a node-only client is a configuration of the code front-ends already run rather than a separate build. The protocol should emit clean events early so the stronger verification below stays cheap.
 
-**NiPoPoWs** (Non-Interactive Proofs of Proof-of-Work) make a stronger model possible: a client small enough to run on a phone can cryptographically verify any claim about the chain without downloading it and without trusting a server. Once the protocol emits clean, standardized events from key transactions (listing created, escrow opened, escrow resolved), such a client can verify on-device that a listing exists at a given price, that a seller has completed N escrows with M disputes, or that an escrow is currently in dispute. The UI needs no trusted backend, and if every centralized front-end goes dark overnight, a light-client app can still read listings, build trades, and verify status. Takedown resistance then rests on the chain and the client's own verification instead of any operator staying online.
+**NiPoPoWs** (Non-Interactive Proofs of Proof-of-Work) make a stronger model possible: a client small enough to run on a phone can cryptographically verify the existence and inclusion of chain facts without downloading the chain and without trusting a server. Once the protocol emits clean, standardized events from key transactions (listing created, escrow opened, escrow resolved), such a client can verify on-device that a listing exists at a given price, that a specific escrow is in a given state, or that a specific completed escrow happened. Counts and rates are a different matter: "N escrows with M disputes" is a completeness claim, so proving it needs a trusted indexer to supply the full set, or an on-chain accumulator the client reads as one committed value. The UI needs no trusted backend for what it can verify, and if every centralized front-end goes dark overnight, a light-client app can still read listings, build trades, and verify status. Takedown resistance then rests on the chain and the client's own verification instead of any operator staying online.
 
-The trade-off is UX. Light clients are slower than indexer-backed front-ends and can only verify what's on-chain, so they can't show off-chain images, reputation scores, or curated lists without trusting some source. A reasonable design lets the user choose which off-chain services to trust (an indexer for search, a reputation service for ranking, a mediator directory for vetting) while all the transaction logic stays verified on-device. **Citadel** (arkadia) and **TrufflΣ** (Flying Pig) are working precedents: desktop clients that talk directly to a local Ergo node, with no third-party services in the path.
+The trade-off is UX. Light clients are slower than indexer-backed front-ends and can only verify what's on-chain, so they can't show off-chain images, reputation scores, or curated lists without trusting some source. A reasonable design lets the user choose which off-chain services to trust (an indexer for search, a reputation service for ranking, a mediator directory for vetting) while all the transaction logic stays verified on-device. [**Citadel**](https://github.com/arkadianet/citadel) (arkadia) is a working precedent: a desktop client that talks directly to a local Ergo node, with no third-party services in the path.
 
 ## Future surface
 
@@ -508,6 +543,7 @@ The failure modes are documented inline next to the designs they threaten (look 
 
 **Prevented by the protocol** (cryptographically enforced):
 - Outright theft by the mediator → [Mediated escrow](#mediated-escrow) (output constraints hard-coded).
+- Escrow substitution or parameter-stripping at purchase → [Mediated escrow](#mediated-escrow), [Appendix A](#appendix-a-full-transaction-examples) (the listing contract pins the escrow hash and validates its terms; the residual is a substituted listing contract, caught by the listing-hash check).
 - Atomic-swap failure modes and listing tampering → [Trustless trade](#trustless-trade).
 
 **Limited but not eliminated** (handled by reputation services plus front-end curation):
@@ -519,17 +555,17 @@ The failure modes are documented inline next to the designs they threaten (look 
 - Absent buyer plus non-delivery plus a faked shipment claim: bounded by tracking-flagging and the buyer's dispute right, but a buyer who's away the whole window is unprotected, and it's only fully closed by a future delivery oracle → [Evidence & delivery verification](#evidence--delivery-verification), [Future surface](#future-surface).
 - Ship-claim gap: a buyer reclaims in the window between the seller getting tracking and submitting the claim, walking off with an in-transit item → [Mediated escrow](#mediated-escrow).
 - Mediator holds a dispute hostage → bounded by the mediation deadline and capped extensions, with a buyer-favorable fallback on timeout → [Mediators](#mediators).
-- Spam listings → [Discovery](#discovery-federated-registries).
+- Spam listings → [Discovery](#discovery-type-standards).
 - Hot-item contention on unique listings (a bounded UX cost, not a scaling flaw) → [Listing options](#listing-options) (concurrency and contention); auctions for contested items.
 - Privacy fingerprinting → [Privacy](#privacy).
 
 **Fundamental, must be designed around at higher layers:**
 - The three [core open problems](VISION.md#the-hard-parts): off-chain delivery that can't be verified, with AI making evidence forgery worse; mediator trust concentration and incentive misalignment; and shipping-address exposure to a pseudonymous counterparty.
 - Immutable contracts mean immutable bugs → [contract family](#register-interface--the-contract-family).
-- Block-denominated timers drift with block time → sized against worst-case-slow blocks so drift only ever lengthens the real window → [Choosing parameters](#choosing-parameters).
+- Block-denominated timers drift with block time → sized against the shortest plausible block interval so drift only ever lengthens the real window → [Choosing parameters](#choosing-parameters).
 - IPFS pinning isn't guaranteed → it degrades gracefully, since searchable text and core metadata stay on-chain in the R7 blob, and marketplaces re-pin the content they care about.
 - Bridge risk and oracle manipulation → [Currencies](#currencies), [Sidecars](#sidecars--config-boxes).
-- Curation-layer monopoly and front-end manipulation → [Front-ends & curation](#front-ends--curation), bounded by the [wallet](#wallet-the-trusted-computing-base) holding transaction integrity.
+- Curation-layer monopoly and front-end manipulation → [Front-ends & curation](#front-ends--curation), bounded by [verification of what gets signed](#verification-the-client-library-and-the-wallet).
 - Information asymmetry on used or custom items → [Evidence & delivery verification](#evidence--delivery-verification).
 - Curation funding under fee competition, and funding the one-time commons → [Monetization](#monetization).
 - Mediator legal exposure (arbitration, escrow-agent, or money-transmitter characterization; it scales with formality and volume, and it sorts the highest-stakes trades toward the least accountable mediators) → [Legal](VISION.md#legal).
@@ -540,7 +576,54 @@ The pattern across the whole register: a hard floor of cryptographic guarantees,
 
 # Appendix A: Full transaction examples
 
-These are illustrative only, and the specific register layouts depend on the chosen contract. The format is pseudo-transaction, with fee outputs left out. The escrow box uses a single `state` enum (`Active` / `Claimed` / `Disputed`) and one reused `deadline` whose meaning depends on the state.
+This appendix gives the escrow's per-door guards, then worked transaction examples.
+
+**Contract guards.** The **Purchase** guard the listing contract runs to create the Escrow Box, then the guards for spending it. Each spend satisfies exactly one guard, plus the cross-cutting invariants: a terminal close burns the State NFT (and may mint the buyer's Receipt NFT); a recreation preserves the NFT, script, and value, or value plus a co-signed top-up; and no output may pay an address the door doesn't name. `state` and `deadline` come from R6, price and bonds from R7, the window and distribution from R8.
+
+```
+Purchase (listing→Escrow):       [allowed_buyers empty ∨ buyer ∈ allowed_buyers]
+                                 ∧ chosen_mediator ∈ accepted_set (inline | AVL+ proof)
+                                 → Escrow.script = pinned_escrow_hash;
+                                   Escrow.value = price + sellerBond + buyerBond + box-min ERG;
+                                   Escrow mints one State NFT;
+                                   state = Active, deadline = HEIGHT + claim_by;
+                                   currency, price, bonds, inspection_window,
+                                     distribution copied from the listing; listing_ref set
+
+Claim    (Active→Claimed):       sellerSig ∧ state = Active
+                                 → state′ = Claimed, deadline′ = HEIGHT + inspection_window
+                                   (optional tracking_commitment written to a register)
+
+Success  (terminal):             (buyerSig ∧ state ∈ {Active, Claimed})
+                                   ∨ (state = Claimed ∧ HEIGHT > deadline)
+                                 → price across R8 (floor; remainder + sub-dust → seller),
+                                   sellerBond → seller, buyerBond → buyer
+
+Refund   (terminal):             (sellerSig ∧ state ∈ {Active, Claimed})
+                                   ∨ (state = Active ∧ HEIGHT > deadline)        // claim_by long-stop
+                                 → price → buyer, sellerBond → seller, buyerBond → buyer
+
+Dispute  (→Disputed):            (buyerSig ∨ sellerSig) ∧ state ∈ {Active, Claimed}
+                                 → state′ = Disputed, deadline′ = HEIGHT + mediation_window
+                                   (dispute fee per the chosen model; never from the box)
+
+Rule     (terminal):             mediatorSig ∧ state = Disputed ∧ HEIGHT ≤ deadline
+                                 → f·price → buyer (f = buyer's share, an integer over the fixed denominator, set by the mediator);
+                                   (1−f)·price across R8 (same floor rule);
+                                   sellerBond → {seller | burn}; buyerBond → {buyer | burn}
+
+Extend   (→Disputed):            mediatorSig ∧ state = Disputed ∧ HEIGHT ≤ deadline
+                                 → deadline′ = deadline + extension (capped at a ceiling)
+
+Timeout  (→Disputed | terminal): state = Disputed ∧ HEIGHT > deadline
+                                 → if a fallback mediator is named and in window, recreate
+                                   Disputed under it; else price → buyer, both bonds → posters
+
+Mutual   (terminal | →escrow):   buyerSig ∧ sellerSig
+                                 → any split (terminal), or recreate a valid same-contract escrow
+```
+
+The worked examples below are illustrative only, and the specific register layouts depend on the chosen contract. The format is pseudo-transaction, with fee outputs left out. The escrow box uses a single `state` enum (`Active` / `Claimed` / `Disputed`) and one reused `deadline` whose meaning depends on the state. The purchase mints the singleton State NFT, every recreation preserves it, and every terminal close (success, refund, dispute resolution, breakdown) burns it in the same transaction; the examples leave that implicit. A transaction mints one new token id, equal to its first input box, so the State NFT's id is the listing box (first input at purchase) and the Receipt NFT's id is the escrow box (first input at settlement); the two therefore mint in separate transactions, and the Receipt's id is what binds it to that specific trade.
 
 **Listing a physical item for a fixed price.** Inputs: the seller's funding box (ERG for fees, dust, and a rent buffer) plus the seller's bond box (currency for the bond). Output: a Listing Box at the Fixed-Price+Escrow contract address, holding the bond plus an ERG buffer (the bond here is a token, so the box needs enough ERG to cover storage rent for its lifetime), with:
 - R4 = seller_pk
@@ -550,13 +633,15 @@ These are illustrative only, and the specific register layouts depend on the cho
 - R8 = (listing_deadline_height, claim_by_blocks, inspection_window_blocks, seller_bond_amount, buyer_bond_amount)
 - R9 = (mediator_acceptance_root, price_distribution=[(seller_pk, 980), (frontend_addr, 20)], optional_ipfs_hash_of_images) *(seller 98%, front-end originator 2%)*
 
-**Purchase and escrow open.** Inputs: the Listing Box plus the buyer's funding box (100 USE plus the buyer bond if any plus the network fee, all payable in USE through babel fees). Output: an Escrow Box holding 100 USE plus the seller's bond plus the buyer bond:
+**Purchase and escrow open.** Inputs: the Listing Box plus the buyer's funding box (100 USE, the buyer bond if any, and the network fee plus the escrow box's minimum ERG; a USE-only buyer sources that small ERG amount through a babel box). Output: an Escrow Box holding 100 USE plus the seller's bond plus the buyer bond:
 - R4 = (seller_pk, buyer_pk)
 - R5 = (chosen_mediator_pk, fallback_mediator_pk) *(chosen from the acceptance root with a membership proof)*
 - R6 = (state = Active, deadline = current_height + claim_by) *(in Active, deadline is the claim long-stop)*
 - R7 = (USE_token_id, 100, seller_bond_amount, buyer_bond_amount) *(bonds are 0 if none)*
 - R8 = (inspection_window_blocks, price_distribution=[(seller_pk, 980), (frontend_addr, 20)]) *(carried over from the listing; recipients paid only on settlement)*
-- R9 = (reference_to_listing_box, ECIES_encrypted_buyer_shipping_handle)
+- R9 = (reference_to_listing_box, ECIES_encrypted_contact_handle)
+
+The listing contract enforces the **Purchase** guard against these outputs: the escrow's script matches the pinned hash, the chosen mediator is proven in the acceptance root, one State NFT is minted, and the terms match the listing.
 
 **Seller claims shipment (Active → Claimed).** Inputs: the Escrow Box (seller's signature; the contract checks state = Active). Output: an updated Escrow Box with `state → Claimed`, `deadline = current_height + inspection_window`, and an optional `tracking_commitment` (a hash, or empty and flagged when absent) written to a register. No funds move.
 
@@ -582,7 +667,7 @@ These are illustrative only, and the specific register layouts depend on the cho
 
 ## Bond sizing
 
-Both bonds are deterrents rather than compensation: on a bad-faith ruling the bond burns, and otherwise it comes back. They guard one axis in particular. *Existence* disputes ("never shipped" or "never arrived") are mostly settled by tracking, so the rate at which a party can fool a mediator there is low and the bond does little work. *Condition* disputes ("shipped or arrived, but worthless or not as described") turn on forgeable evidence, and that's the axis each bond actually deters: the seller bond against a seller shipping garbage, the buyer bond against a buyer fabricating a defect.
+The bonds guard one axis in particular. *Existence* disputes ("never shipped" or "never arrived") are mostly settled by tracking, so the rate at which a party can fool a mediator there is low and the bond does little work. *Condition* disputes ("shipped or arrived, but worthless or not as described") turn on forgeable evidence, and that's the axis each bond actually deters: the seller bond against a seller shipping garbage, the buyer bond against a buyer fabricating a defect.
 
 Take a party weighing whether to act in bad faith, with the price normalized to 1 and a bond `b` (as a fraction of price). Let `f` be the fraction of the price they capture if they win the resulting dispute (for a frivolous buyer, the refund extracted while keeping the item; for a seller, the price kept on successfully defended garbage), and let `q` be their probability of fooling the mediator. The marginal expected value of acting in bad faith over acting honestly is
 
@@ -602,7 +687,7 @@ The sizing rule that follows is loose on purpose, because the bond is only one o
 
 Each side's bond is sized on its own, because the seller holds the leverage before shipping and the buyer holds it after, so each bond is calibrated to the fraud its poster could commit in the phase where they have the upper hand.
 
-**The model takes `q` as an input, and that input is on the move.** Every threshold above assumes some achievable success rate `q` against the mediator, set by evidentiary strength. The first [core open problem](VISION.md#the-hard-parts) is exactly that `q` is climbing over time as AI makes forged condition evidence cheaper and harder to detect. So the bond isn't a stable guarantee. It's a floor that erodes as `q` climbs: a bond sized correctly today is undersized against the same category and mediator a few years from now, unless the mediator's evidence standard rises to match. This is why the deterrent leans on all three terms instead of the bond alone, why reputation stake and category-specialist mediators carry weight the bond mathematically can't, and why this axis is mitigated rather than closed.
+**The model takes `q` as an input, and that input is on the move.** Every threshold above assumes some achievable success rate `q` against the mediator, set by evidentiary strength. The first [core open problem](VISION.md#the-hard-parts) is exactly that `q` is climbing over time as AI makes forged condition evidence cheaper and harder to detect. So the bond works as a floor that erodes as `q` climbs: a bond sized correctly today is undersized against the same category and mediator a few years from now, unless the mediator's evidence standard rises to match. This is why the deterrent leans on all three terms instead of the bond alone, why reputation stake and category-specialist mediators carry weight the bond mathematically can't, and why this axis is mitigated rather than closed.
 
 ## MAD escrow payoff math
 
@@ -613,7 +698,7 @@ Take an item value of 1 and an equal deposit `D` from each side, with payoffs `(
 | **Seller ships**        | (0, 0) honest trade | (−1−D, −D) MAD fires | (−1, +1) seller refunds |
 | **Seller doesn't ship** | (+1, −1) seller scam | (−D, −1−D) MAD fires | (0, 0) refund, no trade |
 
-This isn't a simultaneous-move game. It's sequential (ship, then accept-or-not, then refund-or-not), so the honest `(0, 0)` outcome has to be tested by backward induction rather than by dominance over the grid. Two traps come out of that:
+The game is sequential (ship, then accept-or-not, then refund-or-not), so the honest `(0, 0)` outcome has to be tested by backward induction rather than by dominance over the grid. Two traps come out of that:
 
 - **After shipment, the buyer keeps the item.** Once it ships, the buyer holds value 1. If they just don't accept, the seller's remaining choice is to refund (−1, +1) or fire MAD (−1−D, −D), and since −1 > −1−D, the seller rationally refunds to recover their own deposit. Seeing that coming, the buyer keeps the item *and* gets refunded by staying quiet.
 - **Before shipment, the seller scams.** The mirror image: a seller who never ships and never refunds forces the buyer to choose between eating the loss (−1) and firing MAD (−1−D), and the buyer rationally eats it, so the seller keeps the price (+1, −1) and walks away.
@@ -626,6 +711,8 @@ This isn't a simultaneous-move game. It's sequential (ship, then accept-or-not, 
 
 - **eUTXO.** Extended UTXO. Ergo's state model.
 - **Box.** A UTXO with value, tokens, registers R4–R9, and a guard script.
+- **Client library.** The headless reference implementation of the protocol: box specifications, validation, transaction builders, and decoding a box into readable state. Front-ends, bots, and light clients all run it, reaching the chain through a box-finder.
+- **Box-finder.** The client library's one I/O adapter, pointed at a node, a public explorer, or an indexer. Swapping it trades speed for independence without changing the logic.
 - **Atomic swap.** On-chain trade that fully completes or fully fails.
 - **Escrow box.** Programmable holding box between match and settlement, carrying a `state` (`Active` / `Claimed` / `Disputed`) and one reused `deadline`; funds exit only through the three doors.
 - **Three doors.** Success / refund / dispute: the escrow contract's three terminal exit paths.
@@ -644,7 +731,8 @@ This isn't a simultaneous-move game. It's sequential (ship, then accept-or-not, 
 - **Originator fee.** The price-distribution case where one recipient is the front-end that minted the listing. Not a separate mechanism.
 - **Sidecar / Config Box.** Read-only data-input box referenced by listings for shared state.
 - **Data inputs.** Ergo's term for read-only box references in a transaction; the mechanism behind sidecars.
-- **Singleton Token / State NFT.** An NFT minted once and held in a config or state box; the consuming contract checks it is present to reject spoofed copies.
+- **Singleton Token / State NFT.** An NFT minted once (amount 1) and held in a config or state box; the consuming contract checks it is present to reject spoofed copies, and on each transition the successor box must preserve the NFT, the script, and the box value. This is the standard Ergo state-machine pattern (SigmaUSD, oracle pools, Rosen Bridge). Each Escrow Box mints one at purchase and burns it at terminal settlement, giving the escrow a single identity across all recreations and one `byTokenId` lookup for the live box.
+- **Type standard.** An operator-less type NFT defining a listing or contract standard (name, description, schema URI), referenced read-only via a data input. Front-ends and indexers recognize the types they choose; it is the discovery primitive.
 - **Guardrail.** Hard-coded cap in an immutable contract limiting what a mutable config box can specify.
 - **Sigma protocol.** Ergo's zero-knowledge proof primitive.
 - **`atLeast(k, …)`.** Native ErgoScript threshold primitive proving a k-of-n signing condition was met while concealing *which* k signed; the basis for panelist anti-retaliation.
@@ -660,4 +748,3 @@ This isn't a simultaneous-move game. It's sequential (ship, then accept-or-not, 
 - **Stealth addresses.** Live Ergo feature letting a recipient receive funds without their public address appearing on chain.
 - **Curve Trees.** ZK membership proofs without trusted setup, feasible on Ergo via 6.0's `UnsignedBigInt`; still research-stage.
 - **EIP.** Ergo Improvement Proposal. Referenced: EIP-4 (asset standard), EIP-22 (auction), EIP-23 (oracle pool v2), EIP-24 (artwork/royalty), EIP-28 (wallet auth challenge), EIP-31 (babel fees), proposed EIP-0045 (native STARK verification opcode).
-- **Schelling point.** A natural coordination focal point, shared use of GTIN with no central enforcement is one.
